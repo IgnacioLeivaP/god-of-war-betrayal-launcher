@@ -1,0 +1,112 @@
+diff --git a/minijvm/c/jvm/class_load.c b/minijvm/c/jvm/class_load.c
+index c94ad06..13fed8d 100644
+--- a/minijvm/c/jvm/class_load.c
++++ b/minijvm/c/jvm/class_load.c
+@@ -1735,6 +1735,8 @@ s32 parseMethodPara(Utf8String *methodType, Utf8String *out) {
+  * Convert each index into a direct address reference to speed up processing
+  * @param clazz class
+  */
++java_native_fun (*gownx_puente)(JClass *clazz, MethodInfo *metodo) = NULL;
++
+ void _class_optimize(JClass *clazz) {
+     Utf8String *ustr = class_get_utf8_string(clazz,
+                                              class_get_constant_classref(clazz, clazz->cff.this_class)->stringIndex);
+@@ -1855,6 +1857,18 @@ void _class_optimize(JClass *clazz) {
+                 ptr->annotationsAttr = _parse_runtime_visible_annotations(ptr->attributes[j].info);
+             }
+         }
++        // gow_nx: "puentes" (gow_nx/src/nat/puentes.c). Si el gancho devuelve una funcion, el
++        // metodo se ejecuta en C en vez de su bytecode, como un nativo ya resuelto. Se le quita
++        // el bytecode, como a un nativo de verdad: si no, el JIT, en las llamadas virtuales,
++        // salta al bytecode sin mirar is_native.
++        if (gownx_puente && !ptr->is_native) {
++            java_native_fun f = gownx_puente(clazz, ptr);
++            if (f) {
++                ptr->is_native = 1;
++                ptr->native_func = f;
++                ptr->converted_code = NULL;
++            }
++        }
+     }
+     for (i = 0; i < clazz->attributePool.attribute_used; i++) {
+         AttributeInfo *ptr = &clazz->attributePool.attribute[i];
+diff --git a/minijvm/c/jvm/jvm.h b/minijvm/c/jvm/jvm.h
+index a8abf5a..15d9782 100644
+--- a/minijvm/c/jvm/jvm.h
++++ b/minijvm/c/jvm/jvm.h
+@@ -452,6 +452,11 @@ typedef struct _JdwpClient JdwpClient;
+ 
+ typedef s32 (*java_native_fun)(Runtime *runtime, JClass *p);
+ 
++// gow_nx: gancho de "puentes" (metodos Java ejecutados en C); ver class_load.c y
++// gow_nx/src/nat/puentes.c. Se llama una vez por metodo al cargar cada clase, con los nombres
++// de la clase, del metodo y de los campos ya resueltos. NULL = sin puentes.
++extern java_native_fun (*gownx_puente)(JClass *clazz, MethodInfo *metodo);
++
+ typedef void (*jni_fun)(__refer);
+ 
+ enum {
+diff --git a/minijvm/c/utils/d_type.h b/minijvm/c/utils/d_type.h
+index ae8f4c6..e9832c9 100644
+--- a/minijvm/c/utils/d_type.h
++++ b/minijvm/c/utils/d_type.h
+@@ -65,6 +65,10 @@
+ #ifdef __ANDROID__
+ #define __JVM_OS_ANDROID__ 1
+ #endif
++#elif defined(__SWITCH__)
++// Nintendo Switch (devkitA64 + libnx): POSIX parcial, sin mmap/dlopen
++#define __JVM_OS_SWITCH__ 1
++#define __JVM_OS_LINUX__ 1   // el resto del codigo toma la rama POSIX/Linux
+ #elif defined(_POSIX_VERSION)
+ // POSIX
+ #define __JVM_OS_CYGWIN__ 1
+@@ -74,7 +78,7 @@
+ #   error "Unknown compiler"
+ #endif
+ 
+-#if 1
++#if !defined(__SWITCH__)
+ #define __JVM_PRI_ALLOC__ 1
+ #endif
+ 
+diff --git a/minijvm/c/utils/sljit/sljitLir.c b/minijvm/c/utils/sljit/sljitLir.c
+index 539cbd7..147df0d 100644
+--- a/minijvm/c/utils/sljit/sljitLir.c
++++ b/minijvm/c/utils/sljit/sljitLir.c
+@@ -397,7 +397,8 @@ struct sljit_extended_label {
+ 
+ #endif /* SLJIT_EXECUTABLE_ALLOCATOR */
+ 
+-#if (defined SLJIT_PROT_EXECUTABLE_ALLOCATOR && SLJIT_PROT_EXECUTABLE_ALLOCATOR)
++/* gow_nx: asignador propio con dos vistas (Switch) -> la vista RX tambien esta desplazada */
++#if (defined SLJIT_PROT_EXECUTABLE_ALLOCATOR && SLJIT_PROT_EXECUTABLE_ALLOCATOR) || defined(GOWNX_SLJIT_DOS_VISTAS)
+ #define SLJIT_ADD_EXEC_OFFSET(ptr, exec_offset) ((sljit_u8 *)(ptr) + (exec_offset))
+ #else /* !SLJIT_PROT_EXECUTABLE_ALLOCATOR */
+ #define SLJIT_ADD_EXEC_OFFSET(ptr, exec_offset) ((sljit_u8 *)(ptr))
+diff --git a/minijvm/java/src/main/java/sun/misc/Launcher.java b/minijvm/java/src/main/java/sun/misc/Launcher.java
+index 5a449aa..90909b1 100644
+--- a/minijvm/java/src/main/java/sun/misc/Launcher.java
++++ b/minijvm/java/src/main/java/sun/misc/Launcher.java
+@@ -41,6 +41,21 @@ public class Launcher {
+             URL url = VmUtil.getFileUrl(path, paths);
+             return url;
+         }
++
++        // gow_nx: leer el recurso directamente del classpath, sin pasar por una URL
++        // "jar:file:///<ruta absoluta>": en la Switch la ruta es "sdmc:/..." y los dos
++        // puntos rompen la URL (getResourceAsStream devolvia null).
++        @Override
++        public java.io.InputStream getResourceAsStream(String path) {
++            String p = path;
++            while (p.startsWith("/")) p = p.substring(1);
++            try {
++                byte[] d = VmUtil.getFileData(p, paths);
++                if (d != null) return new java.io.ByteArrayInputStream(d);
++            } catch (Throwable e) {
++            }
++            return super.getResourceAsStream(path);
++        }
+     }
+ 
+     /**
